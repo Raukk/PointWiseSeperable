@@ -1,0 +1,235 @@
+import tensorflow as tf
+import math
+
+
+class OnesComplement2d(tf.keras.layers.Layer):
+    """
+    Yes I'm 99% sure that Ones Complement is a math term with meaning nothing like this usage.
+    I use it as the official name here *Ironically* so as to annoy all the math and statistics people.
+    NVM, it's a programming, binarry term. And I was going to make a joke about the 1x1 convolutions complementing me
+    
+    This is a 2d Convolutional layer, and expects inputs accordingly
+    """
+    RunningTotal = 0
+    RunningTotal_traditional = 0
+    RunningTotal_Savings = 0
+    RunningTotal_Params = 0
+    size_threshold = 5
+
+    def __init__(self, 
+                 filters,
+                 activation=None,
+                 padding='same', 
+                 strides=(1,1),
+                 data_format = 'channels_last',
+                 trainable=True,
+                 name=None,
+                 dtype=None,
+                 dynamic=False,
+                 **kwargs):
+
+        super(OnesComplement2d, self).__init__(
+                trainable=trainable,
+                name=name,
+                dtype=dtype,
+                #dynamic=dynamic,
+                **kwargs)
+
+        self.filters = filters
+        self.activation = activation
+        self.padding = padding
+        self.strides=strides
+        self.data_format = data_format
+        self.use_standard = False # in some cases we want to just use the standard Conv2d instead of this complex one 
+
+    def compute_output_shape(self, input_shape):
+         self.build(input_shape)
+
+    def build(self, input_shape):
+
+        # output is the same as input except that the Channels are of lenght 'self.filters'
+        shape = []
+        
+        for dim in list(input_shape):
+            if(dim is None or dim == None or (False == isinstance(dim, int) and dim.value == None)):
+                shape.append(None)
+            elif(isinstance(dim, int)):
+                shape.append(int(dim))
+            else:
+                shape.append(int(dim.value))
+
+        #print("Received input shape: ")
+        #print(shape)
+
+        input_length = None
+        input_width = None
+
+
+        if (self.data_format == 'channels_last'):
+            self.input_channels = shape[-1]
+            input_length = int(shape[1])
+            input_width = int(shape[2])
+            shape[-1] = self.filters
+        elif (self.data_format == 'channels_first'):
+            self.input_channels = shape[1]
+            input_length = int(shape[2])
+            input_width = int(shape[3])
+            shape[1] = self.filters
+        else:
+            # can't do anything if it's not Channels first or last since it has no channels
+            raise Exception('The data_format provided did not have an appropriate value of either "channels_last" or "channels_first" ')
+        
+        self.input_splits = math.floor(math.sqrt(self.input_channels))
+        self.output_splits = math.floor(math.sqrt(self.filters))
+        
+        if(self.input_splits < OnesComplement2d.size_threshold and self.output_splits < OnesComplement2d.size_threshold): 
+
+            self.use_standard = True
+
+            # this is a short circut for small numbers of filters where the added complexity of this layer does not provide a benefit
+            self.standard_layer = tf.keras.layers.Conv2D(self.filters, 
+                                                    (1,1), 
+                                                    activation = self.activation, 
+                                                    padding = self.padding,
+                                                    strides = self.strides,
+                                                    data_format = self.data_format)
+
+            return tuple(shape)
+
+        #Computational complexity (MAC ops):
+        ##Traditional
+        traditional_computations = int(self.input_channels) * int(self.filters) 
+        total_traditional_computations = input_length * input_width * traditional_computations
+        #print("A Traditional approach would take "+str(traditional_computations)+" MAC ops per data point. With ("+str(input_length)+","+str(input_width)+") data points per example, the total number of MAC ops for this layer is " + str(total_traditional_computations))
+
+        #Mine:
+        this_computations = int(self.input_channels) * self.output_splits + int(self.filters) * self.input_splits
+        total_this_computations = input_length * input_width * this_computations
+        #print("This approach would take "+str(this_computations)+" MAC ops per data point. With ("+str(input_length)+","+str(input_width)+") data points per example, the total number of MAC ops for this layer is " + str(total_this_computations))
+        
+        self.savings = traditional_computations - this_computations
+        self.total_savings = total_traditional_computations - total_this_computations
+        self.savings_ratio = traditional_computations / this_computations
+
+        
+        OnesComplement2d.RunningTotal += total_this_computations
+        OnesComplement2d.RunningTotal_traditional += total_traditional_computations
+        OnesComplement2d.RunningTotal_Savings += self.total_savings
+        OnesComplement2d.RunningTotal_Params += this_computations # there is one parameter per point calculation
+
+
+        #print("WOW")
+        #print("That's a per point savings of "+str(self.savings)+" MAC ops per point, or "+str(self.total_savings)+" MAC ops per sample, or "+str(self.savings_ratio)+" savins ratio!")
+        
+
+
+        self.first_convo_layers = []
+        self.last_convo_layers = []
+
+        if (self.data_format == 'channels_last'):  
+
+            # first split the Channels into 'self.input_splits' different groups, in round robin order
+            for x in range(0, self.input_splits):
+                
+                firstlayer = tf.keras.layers.Conv2D(self.output_splits, 
+                                                    (1,1), 
+                                                    activation='linear', 
+                                                    padding = self.padding,
+                                                    strides = self.strides,
+                                                    data_format=self.data_format)
+
+                self.first_convo_layers.append(firstlayer)
+
+            # Then Concat all those inputs
+            self.intermidiate_concat = tf.keras.layers.Concatenate(axis = -1)
+
+
+            # Split the outpur filters between each of the secondary layers
+            filters_per = int(math.floor(self.filters / self.output_splits))
+            remainder = self.filters % self.output_splits
+
+            # And feed those into a second set of Convolutions 
+            for x in range(0, self.output_splits):
+                # deal with odd numbered filter output by having some return an extra filter
+                this_filters = filters_per
+                if (remainder > 0):
+                    this_filters += 1
+                    remainder -= 1
+
+                secondlayer = tf.keras.layers.Conv2D(
+                    this_filters, 
+                    (1,1), 
+                    activation=self.activation, 
+                    padding = 'same',
+                    strides = (1,1),
+                    data_format=self.data_format)
+                self.last_convo_layers.append(secondlayer)
+
+            # And Concat the final outputs together
+            self.final_concat = tf.keras.layers.Concatenate(axis = -1)
+
+
+
+
+
+            #TODO add the code for other data format 
+
+
+
+
+        self.built = True
+
+        return tuple(shape)
+
+
+    def call(self, inputs):
+
+
+        if(self.use_standard):
+            # this is a short circut for small numbers of filters where the added complexity of this layer does not provide a benefit
+            return self.standard_layer(inputs)
+
+        
+        all_inputs = []
+        all_outputs = []
+        intermediate_outputs = []
+        intermediate_inputs = []
+
+        if (self.data_format == 'channels_last'):  
+
+            # first split the Channels into 'self.input_splits' different groups, in round robin order
+            for x in range(0, self.input_splits):
+                # this should get every 'self.input_splits' input with an incrementing offset for each
+                split_input = inputs[:,:,:,x :: self.input_splits]
+
+                all_inputs.append(split_input)
+
+                firstlayer = self.first_convo_layers[x]
+
+                intermediate_outputs.append(firstlayer(split_input))
+
+            # Then Concat all those inputs
+            intermidiate = self.intermidiate_concat(intermediate_outputs)
+
+            # And Round Robin the concated inputs
+            for x in range(0, self.output_splits):
+                # this should get every 'self.output_splits' input with an incrementing offset for each
+                split_intermediate_input = intermidiate[:,:,:,x :: self.output_splits]
+                
+                intermediate_inputs.append(split_intermediate_input)
+
+                secondlayer = self.last_convo_layers[x] 
+
+                all_outputs.append(secondlayer(split_intermediate_input))
+
+            # And Concat the final outputs together
+            return self.final_concat(all_outputs)
+
+
+
+
+        else:
+            # can't do anything if it's not Channels first or last since it has no channels
+            raise Exception('The data_format provided did not have an appropriate value of either "channels_last" or "channels_first" ')
+
+

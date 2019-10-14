@@ -1,0 +1,197 @@
+import tensorflow as tf
+import math
+
+
+class OnesComplement2d(tf.keras.layers.Layer):
+    """
+    Yes I'm 99% sure that Ones Complement is a math term with meaning nothing like this usage.
+    I use it as the official name here *Ironically* so as to annoy all the math and statistics people.
+    NVM, it's a programming, binarry term. And I was going to make a joke about the 1x1 convolutions complementing me
+    
+    This is a 2d Convolutional layer, and expects inputs accordingly
+    """
+    RunningTotal = 0
+    RunningTotal_traditional = 0
+    RunningTotal_Savings = 0
+    RunningTotal_Params = 0
+    size_threshold = 5
+
+    def __init__(self, 
+                 filters,
+                 activation=None,
+                 padding='same', 
+                 strides=(1,1),
+                 data_format = 'channels_last',
+                 trainable=True,
+                 name=None,
+                 dtype=None,
+                 dynamic=False,
+                 **kwargs):
+
+        super(OnesComplement2d, self).__init__(
+                trainable=trainable,
+                name=name,
+                dtype=dtype,
+                #dynamic=dynamic,
+                **kwargs)
+
+        self.filters = filters
+        self.output_splits = math.floor(math.sqrt(self.filters))
+
+        if( int(self.filters % self.output_splits) > 0):
+            self.filters = self.filters + int(self.filters % self.output_splits)
+            print("Output filters value was increased to " + str(self.filters) + " to be a multiple of "+str(self.output_splits)+" (the SQRT of filters).")
+        
+        self.activation = activation
+        self.padding = padding
+        self.strides = strides
+        self.data_format = data_format
+        self.use_standard = False # in some cases we want to just use the standard Conv2d instead of this complex one 
+
+    def compute_output_shape(self, input_shape):
+         self.build(input_shape)
+
+    def build(self, input_shape):
+
+        # output is the same as input except that the Channels are of lenght 'self.filters'
+        shape = []
+        
+        for dim in list(input_shape):
+            if(dim is None or dim == None or (False == isinstance(dim, int) and dim.value == None)):
+                shape.append(None)
+            elif(isinstance(dim, int)):
+                shape.append(int(dim))
+            else:
+                shape.append(int(dim.value))
+
+
+        self.input_length = None
+        self.input_width = None
+
+
+        if (self.data_format == 'channels_last'):
+            self.input_channels = int(shape[-1])
+            self.input_length = int(shape[1])
+            self.input_width = int(shape[2])
+            shape[-1] = self.filters
+        elif (self.data_format == 'channels_first'):
+            self.input_channels = int(shape[1])
+            self.input_length = int(shape[2])
+            self.input_width = int(shape[3])
+            shape[1] = self.filters
+        else:
+            # can't do anything if it's not Channels first or last since it has no channels
+            raise Exception('The data_format provided did not have an appropriate value of either "channels_last" or "channels_first" ')
+        
+        self.input_splits = math.floor(math.sqrt(self.input_channels))
+        
+        if(self.input_splits < OnesComplement2d.size_threshold and self.output_splits < OnesComplement2d.size_threshold): 
+
+            self.use_standard = True
+
+            return tuple(shape)
+
+        self.total_input_points = int(self.input_length * self.input_width)
+
+        # figure out what the input space depth is, where the zero padded input channels can be shaped N by self.input_splits
+        self.input_split_depth = int(math.ceil( int(self.input_channels) / int(self.input_splits)))
+        # calculate how many zero padded chanels we need
+        self.zero_pad_input = int(int(self.input_splits * self.input_split_depth) - int(self.input_channels))
+        
+        # This equals the output multiplier needed
+        self.output_split_depth = int(math.ceil( self.filters / int(self.output_splits)))
+
+        #Computational complexity (MAC ops):
+        ##Traditional
+        traditional_computations = int(self.input_channels) * int(self.filters) 
+        total_traditional_computations = self.input_length * self.input_width * traditional_computations
+        #print("A Traditional approach would take "+str(traditional_computations)+" MAC ops per data point. With ("+str(input_length)+","+str(input_width)+") data points per example, the total number of MAC ops for this layer is " + str(total_traditional_computations))
+
+        #Mine:
+        this_computations = int(self.input_splits * self.input_split_depth) * self.output_splits + int(self.filters) * self.input_splits
+        total_this_computations = self.input_length * self.input_width * this_computations
+        #print("This approach would take "+str(this_computations)+" MAC ops per data point. With ("+str(input_length)+","+str(input_width)+") data points per example, the total number of MAC ops for this layer is " + str(total_this_computations))
+        
+        self.savings = traditional_computations - this_computations
+        self.total_savings = total_traditional_computations - total_this_computations
+        self.savings_ratio = traditional_computations / this_computations
+
+        
+        OnesComplement2d.RunningTotal += total_this_computations
+        OnesComplement2d.RunningTotal_traditional += total_traditional_computations
+        OnesComplement2d.RunningTotal_Savings += self.total_savings
+        OnesComplement2d.RunningTotal_Params += this_computations # there is one parameter per point calculation
+
+
+        #print("WOW")
+        #print("That's a per point savings of "+str(self.savings)+" MAC ops per point, or "+str(self.total_savings)+" MAC ops per sample, or "+str(self.savings_ratio)+" savins ratio!")
+
+
+        # Build the intial the weight matrixes
+        # first weights should be `input_splits` matrixes of size `input_split_depth` by `OUT_splits`
+        self.first_weights = []
+
+        for i in range(0, int(self.input_splits)):
+            self.first_weights.append( self.add_weight(name='first_kernel_' + str(i), 
+                                      shape=( int(self.input_split_depth), int(self.output_splits) ),
+                                      initializer='uniform',
+                                      trainable=True)
+                                      )
+
+        # first weights should be `output_splits` matrixes of size `input_splits` by `output_split_depth`
+        self.last_weights = []        
+        for j in range(0, int(self.output_splits)):
+            self.last_weights.append( self.add_weight(name='last_kernel_' + str(j), 
+                                      shape=( int(self.input_splits), int(self.output_split_depth) ),
+                                      initializer='uniform',
+                                      trainable=True)
+                                     )
+
+        self.built = True
+
+        return tuple(shape)
+
+
+    def call(self, inputs):
+
+
+        if(self.use_standard):
+            # this is a short circut for small numbers of filters where the added complexity of this layer does not provide a benefit
+            return  tf.keras.layers.Conv2D(self.filters, 
+                                                    (1,1), 
+                                                    activation = self.activation, 
+                                                    padding = self.padding,
+                                                    strides = self.strides,
+                                                    data_format = self.data_format)(inputs)
+
+
+        if (self.data_format == 'channels_last'):  
+
+            # Check if we need to zero pad the input. which is likly for almost all inputs unless their filters 
+            if(self.zero_pad_input > 0):
+                # Expand dims and zero pad the 
+                expanded = tf.keras.backend.expand_dims(inputs, axis=-1)
+                padded = tf.keras.layers.ZeroPadding3D(((0, 0),(0, 0),(0, self.zero_pad_input)))(expanded)
+                inputs =  tf.keras.backend.squeeze(padded, axis=-1)
+
+
+            intermediate_output = []
+            for i in range(0, self.input_splits):
+                split_start = i * self.input_split_depth
+                split_end = ((i+1) * self.input_split_depth) #- 1 
+                intermediate_output.append(tf.keras.backend.dot(inputs[:, :, :, split_start:split_end], self.first_weights[i]))
+
+
+            final_outputs = []
+            for j in range(0, self.output_splits):
+                # it probably would have been easier to just concat it first
+                temp = [tf.keras.backend.expand_dims(item[:, :, :, j], axis=-1) for item in intermediate_output] 
+                intermediate_input = tf.keras.backend.concatenate( temp, axis=-1 ) 
+                final_outputs.append( tf.keras.backend.dot(intermediate_input, self.last_weights[j]) )
+
+
+            concat = tf.keras.backend.concatenate( final_outputs, axis=-1 ) 
+            # TODO: should I add / use a Bias? 
+
+
+            return concat
